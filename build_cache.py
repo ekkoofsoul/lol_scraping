@@ -1,339 +1,291 @@
 import asyncio
 import json
 import os
-import random
-import re
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from collections import defaultdict
+from typing import Any, Dict, List, Tuple, Optional
 
 import aiohttp
-from playwright.async_api import async_playwright, Response
 
+RIOT_API_KEY = os.getenv("RIOT_API_KEY")
+if not RIOT_API_KEY:
+    raise SystemExit("Set RIOT_API_KEY env var first (RGAPI-...).")
+
+# Routing:
+PLATFORM_HOST = "https://euw1.api.riotgames.com"     # EUW1 platform routing
+REGIONAL_HOST = "https://europe.api.riotgames.com"   # Match-V5 regional routing (EUROPE)
+
+QUEUE_RANKED_SOLO = 420
+
+OUT_CACHE = "draft_cache_euw_emerald.json"
 
 # ----------------------------
-# Riot Data Dragon: champion list
+# Small HTTP helper with basic rate-limit handling
 # ----------------------------
+class RiotHTTP:
+    def __init__(self, session: aiohttp.ClientSession):
+        self.s = session
 
-async def fetch_latest_ddragon_version(session: aiohttp.ClientSession) -> str:
-    async with session.get("https://ddragon.leagueoflegends.com/api/versions.json") as r:
-        r.raise_for_status()
-        versions = await r.json()
-        return versions[0]
+    async def get_json(self, url: str, params: Optional[dict] = None) -> Any:
+        headers = {"X-Riot-Token": RIOT_API_KEY}
+        while True:
+            async with self.s.get(url, headers=headers, params=params) as r:
+                if r.status == 429:
+                    # Respect Retry-After if provided
+                    ra = r.headers.get("Retry-After")
+                    wait = float(ra) if ra else 1.0
+                    await asyncio.sleep(wait + 0.25)
+                    continue
+                if r.status >= 400:
+                    txt = await r.text()
+                    raise RuntimeError(f"HTTP {r.status} for {url} params={params} body={txt[:200]}")
+                return await r.json()
 
-async def fetch_all_champions(session: aiohttp.ClientSession) -> List[str]:
+# ----------------------------
+# Data Dragon champId <-> champName mapping
+# ----------------------------
+async def fetch_ddragon_champion_map(http: RiotHTTP) -> Tuple[Dict[int, str], Dict[str, int]]:
+    # Data Dragon versions + champion.json
+    versions = await http.get_json("https://ddragon.leagueoflegends.com/api/versions.json")
+    version = versions[0]
+    champ_json = await http.get_json(f"https://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/champion.json")
+
+    id_to_name: Dict[int, str] = {}
+    name_to_id: Dict[str, int] = {}
+
+    for champ_name, obj in champ_json["data"].items():
+        champ_id = int(obj["key"])  # numeric championId as string
+        id_to_name[champ_id] = champ_name
+        name_to_id[champ_name.lower()] = champ_id
+
+    return id_to_name, name_to_id
+
+# ----------------------------
+# Getting Emerald players (EUW) -> puuids
+# ----------------------------
+async def fetch_emerald_entries(http: RiotHTTP, division: str, page: int) -> List[dict]:
+    # League-V4 entries:
+    # /lol/league/v4/entries/{queue}/{tier}/{division}?page=...
+    url = f"{PLATFORM_HOST}/lol/league/v4/entries/RANKED_SOLO_5x5/EMERALD/{division}"
+    return await http.get_json(url, params={"page": page})
+
+async def summoner_by_id(http: RiotHTTP, summoner_id: str) -> dict:
+    url = f"{PLATFORM_HOST}/lol/summoner/v4/summoners/{summoner_id}"
+    return await http.get_json(url)
+
+async def collect_puuids(
+    http: RiotHTTP,
+    target_puuids: int = 300,
+    max_pages_per_div: int = 2,
+) -> List[str]:
     """
-    Returns champion slugs used by Lolalytics URLs (usually lowercase, no spaces/apostrophes).
-    We'll start from Riot's official IDs, then normalize to lolalytics-style.
+    Collect a sample of Emerald players' PUUIDs.
+    Emerald has divisions I-IV; we sample pages from each until we hit target_puuids.
     """
-    version = await fetch_latest_ddragon_version(session)
-    url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/champion.json"
-    async with session.get(url) as r:
-        r.raise_for_status()
-        data = await r.json()
+    puuids: List[str] = []
+    seen = set()
 
-    # Riot "id" is already the canonical key (e.g., "AurelionSol", "KhaZix")
-    ids = sorted(data["data"].keys())
+    for division in ["I", "II", "III", "IV"]:
+        for page in range(1, max_pages_per_div + 1):
+            entries = await fetch_emerald_entries(http, division, page)
+            if not entries:
+                break
 
-    def to_lolalytics_slug(riot_id: str) -> str:
-        # Lolalytics uses lowercase and usually removes punctuation.
-        # Commonly works: AurelionSol -> aurelionsol, KhaZix -> khazix
-        return re.sub(r"[^a-z0-9]", "", riot_id.lower())
+            # entries include summonerId; we need puuid via summoner-v4
+            for e in entries:
+                sid = e.get("summonerId")
+                if not sid:
+                    continue
+                # Fetch puuid
+                s = await summoner_by_id(http, sid)
+                puuid = s.get("puuid")
+                if puuid and puuid not in seen:
+                    seen.add(puuid)
+                    puuids.append(puuid)
+                    if len(puuids) >= target_puuids:
+                        return puuids
 
-    return [to_lolalytics_slug(x) for x in ids]
-
+    return puuids
 
 # ----------------------------
-# Lolalytics JSON capture & parsing (same idea as earlier)
+# Match fetch + aggregation
 # ----------------------------
+async def fetch_match_ids_for_puuid(http: RiotHTTP, puuid: str, count: int = 20) -> List[str]:
+    url = f"{REGIONAL_HOST}/lol/match/v5/matches/by-puuid/{puuid}/ids"
+    params = {
+        "queue": QUEUE_RANKED_SOLO,
+        "type": "ranked",
+        "start": 0,
+        "count": count,
+    }
+    return await http.get_json(url, params=params)
 
-@dataclass
-class DuoStat:
-    champion: str
-    winrate: Optional[float] = None
-    games: Optional[int] = None
-    delta1: Optional[float] = None
-    delta2: Optional[float] = None
+async def fetch_match(http: RiotHTTP, match_id: str) -> dict:
+    url = f"{REGIONAL_HOST}/lol/match/v5/matches/{match_id}"
+    return await http.get_json(url)
 
-def _try_float(x: Any) -> Optional[float]:
-    try:
-        return float(x)
-    except Exception:
-        return None
+def update_stats_from_match(
+    match: dict,
+    overall: Dict[int, List[int]],
+    with_ally: Dict[int, Dict[int, List[int]]],
+    vs_enemy: Dict[int, Dict[int, List[int]]],
+):
+    info = match.get("info", {})
+    parts = info.get("participants", [])
+    if len(parts) != 10:
+        return
 
-def _try_int(x: Any) -> Optional[int]:
-    try:
-        return int(x)
-    except Exception:
-        return None
+    # Build team lists
+    team_to_champs: Dict[int, List[Tuple[int, bool]]] = defaultdict(list)  # teamId -> [(champId, win)]
+    for p in parts:
+        champ = p.get("championId")
+        team = p.get("teamId")
+        win = bool(p.get("win"))
+        if champ and team:
+            team_to_champs[team].append((int(champ), win))
 
-def _walk(obj: Any):
-    stack = [([], obj)]
-    while stack:
-        path, cur = stack.pop()
-        yield path, cur
-        if isinstance(cur, dict):
-            for k, v in cur.items():
-                stack.append((path + [k], v))
-        elif isinstance(cur, list):
-            for i, v in enumerate(cur):
-                stack.append((path + [i], v))
+    teams = list(team_to_champs.keys())
+    if len(teams) != 2:
+        return
+    t1, t2 = teams[0], teams[1]
 
-def _looks_like_row(item: Any) -> bool:
-    if not isinstance(item, dict):
-        return False
-    keys = {str(k).lower() for k in item.keys()}
-    has_name = any(k in keys for k in ["champion", "champ", "name", "target", "ally", "enemy"])
-    has_wr = any(k in keys for k in ["winrate", "wr", "win"])
-    return has_name and has_wr
+    champs_t1 = team_to_champs[t1]
+    champs_t2 = team_to_champs[t2]
 
-def _extract_rows_from_json(payload: Any) -> List[dict]:
-    candidates = []
-    for _, v in _walk(payload):
-        if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
-            if sum(1 for x in v if _looks_like_row(x)) >= max(1, len(v) // 3):
-                candidates.append(v)
-    candidates.sort(key=len, reverse=True)
-    return candidates[0] if candidates else []
+    # For each champ, update overall + synergy (allies) + vs (enemies)
+    for team_champs, enemy_champs in [(champs_t1, champs_t2), (champs_t2, champs_t1)]:
+        for champ_a, win_a in team_champs:
+            overall[champ_a][0] += 1
+            overall[champ_a][1] += 1 if win_a else 0
 
-def _row_to_duostat(row: dict) -> DuoStat:
-    lower = {str(k).lower(): k for k in row.keys()}
+            # allies
+            for champ_b, _ in team_champs:
+                if champ_b == champ_a:
+                    continue
+                with_ally[champ_a][champ_b][0] += 1
+                with_ally[champ_a][champ_b][1] += 1 if win_a else 0
 
-    def get(*names):
-        for n in names:
-            if n in lower:
-                return row[lower[n]]
-        return None
+            # enemies
+            for champ_e, _ in enemy_champs:
+                vs_enemy[champ_a][champ_e][0] += 1
+                vs_enemy[champ_a][champ_e][1] += 1 if win_a else 0
 
-    champ = get("champion", "champ", "name", "target", "ally", "enemy")
-    if isinstance(champ, dict):
-        champ = champ.get("name") or champ.get("champion") or champ.get("key") or str(champ)
-    champ = str(champ) if champ is not None else "UNKNOWN"
+def top_synergies_and_weak_against(
+    champ_id: int,
+    overall: Dict[int, List[int]],
+    with_ally: Dict[int, Dict[int, List[int]]],
+    vs_enemy: Dict[int, Dict[int, List[int]]],
+    id_to_name: Dict[int, str],
+    top_n: int = 10,
+    min_games_pair: int = 30,
+) -> Dict[str, Any]:
+    games, wins = overall.get(champ_id, [0, 0])
+    base_wr = (wins / games) if games else None
 
-    win = get("winrate", "wr", "win")
-    games = get("games", "count", "n", "matches")
-    d1 = get("delta1", "delta_1", "d1")
-    d2 = get("delta2", "delta_2", "d2")
-
-    return DuoStat(
-        champion=champ,
-        winrate=_try_float(win),
-        games=_try_int(games),
-        delta1=_try_float(d1),
-        delta2=_try_float(d2),
-    )
-
-async def scrape_one(page, champion: str, role: str, region: str, tier: str, patch: Optional[str], top_n: int) -> Dict[str, Any]:
-    base = f"https://lolalytics.com/lol/{champion}/build/"
-    params = []
-    if tier: params.append(f"tier={tier}")
-    if region: params.append(f"region={region}")
-    if patch: params.append(f"patch={patch}")
-    if role: params.append(f"lane={role}")
-    url = base + ("?" + "&".join(params) if params else "")
-
-    captured_json: List[Tuple[str, Any]] = []
-    debug_responses: List[Dict[str, Any]] = []
-
-    # capture ANY likely XHR/fetch responses, even if content-type isn't application/json
-    def looks_like_api(u: str) -> bool:
-        u = u.lower()
-        return any(k in u for k in [
-            "/api/", "graphql", "matchup", "counter", "synergy", "duo", "pair"
-        ])
-
-    async def on_response(resp: Response):
-        try:
-            u = resp.url
-            status = resp.status
-            ct = (resp.headers.get("content-type") or "").lower()
-
-            # keep a small debug trail
-            if len(debug_responses) < 50:
-                debug_responses.append({"url": u, "status": status, "content_type": ct})
-
-            if status != 200:
-                return
-
-            if not looks_like_api(u):
-                # Still allow actual JSON content-types even if URL doesn't look like API
-                if "json" not in ct:
-                    return
-
-            # Try resp.json() first, else parse text as JSON
-            data = None
-            try:
-                data = await resp.json()
-            except Exception:
-                try:
-                    txt = await resp.text()
-                except Exception:
-                    return
-                data = _safe_json_from_text(txt)
-
-            if data is not None:
-                captured_json.append((u, data))
-
-        except Exception:
-            pass
-
-    page.on("response", on_response)
-
-    # Load page
-    await page.goto(url, wait_until="domcontentloaded")
-    await page.wait_for_load_state("networkidle")
-
-    # Nudge lazy-loading
-    await page.mouse.wheel(0, 3500)
-    await page.wait_for_timeout(1200)
-    await page.mouse.wheel(0, 3500)
-    await page.wait_for_timeout(1200)
-
-    # --- Post-process captured JSON (reuse your existing _extract_rows_from_json etc.) ---
-    synergy_rows: List[dict] = []
-    counter_rows: List[dict] = []
-
-    for u, payload in captured_json:
-        u_low = u.lower()
-        payload_str = ""
-        try:
-            payload_str = json.dumps(payload).lower()
-        except Exception:
-            payload_str = ""
-
-        is_synergy = any(k in u_low for k in ["synergy", "duo", "pair"]) or any(k in payload_str for k in ["synergy", "duo", "pair", "ally"])
-        is_counter = any(k in u_low for k in ["counter", "matchup", "vs"]) or any(k in payload_str for k in ["counter", "matchup", "enemy", "weak"])
-
-        rows = _extract_rows_from_json(payload)
-        if not rows:
-            continue
-
-        if is_synergy and not synergy_rows:
-            synergy_rows = rows
-        if is_counter and not counter_rows:
-            counter_rows = rows
-
-    synergies = [_row_to_duostat(r) for r in synergy_rows]
-    weak_against = [_row_to_duostat(r) for r in counter_rows]
-
-    synergies.sort(key=lambda s: (s.winrate is not None, s.winrate), reverse=True)
-    weak_against.sort(key=lambda s: (s.winrate is not None, s.winrate), reverse=True)
-
-    def norm(xs):
-        out = []
-        for s in xs[:top_n]:
-            out.append({
-                "champion": s.champion,
-                "winrate": s.winrate,
-                "games": s.games,
-                "delta1": s.delta1,
-                "delta2": s.delta2,
+    # synergies by delta (pair_wr - base_wr)
+    syn_list = []
+    if base_wr is not None:
+        for ally_id, (g, w) in with_ally.get(champ_id, {}).items():
+            if g < min_games_pair:
+                continue
+            wr = w / g
+            syn_list.append({
+                "champion": id_to_name.get(ally_id, str(ally_id)),
+                "winrate": round(wr * 100, 2),
+                "games": g,
+                "delta": round((wr - base_wr) * 100, 2),
             })
-        return out
+        syn_list.sort(key=lambda x: (x["delta"], x["games"]), reverse=True)
+
+    # weak against: lowest winrate vs enemy
+    weak_list = []
+    for enemy_id, (g, w) in vs_enemy.get(champ_id, {}).items():
+        if g < min_games_pair:
+            continue
+        wr = w / g
+        weak_list.append({
+            "champion": id_to_name.get(enemy_id, str(enemy_id)),
+            "winrate": round(wr * 100, 2),
+            "games": g,
+        })
+    weak_list.sort(key=lambda x: (x["winrate"], -x["games"]))
 
     return {
-        "champion": champion,
-        "role": role,
-        "region": region,
-        "tier": tier,
-        "patch": patch,
-        "source_url": url,
-        "synergies_top": norm(synergies),
-        "weak_against_top": norm(weak_against),
-        "captured_json_responses": len(captured_json),
-        # helpful when it still fails:
-        "debug_first_responses": debug_responses[:10],
+        "overall": {"games": games, "winrate": round(base_wr * 100, 2) if base_wr is not None else None},
+        "synergies_top": syn_list[:top_n],
+        "weak_against_top": weak_list[:top_n],
     }
 
-
-# ----------------------------
-# Cache I/O (jsonl + index)
-# ----------------------------
-
-def load_done_keys(index_path: str) -> set:
-    if not os.path.exists(index_path):
-        return set()
-    with open(index_path, "r", encoding="utf-8") as f:
-        idx = json.load(f)
-    return set(idx.get("done_keys", []))
-
-def save_done_keys(index_path: str, done_keys: set):
-    tmp = index_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"done_keys": sorted(done_keys)}, f)
-    os.replace(tmp, index_path)
-
-def append_jsonl(path: str, obj: dict):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-
-
-# ----------------------------
-# Main build loop
-# ----------------------------
-
-async def build_cache(
-    out_jsonl: str = "lolalytics_cache.jsonl",
-    out_index: str = "lolalytics_cache_index.json",
-    roles: List[str] = None,
-    region: str = "all",
-    tier: str = "emerald_plus",
-    patch: Optional[str] = None,
-    top_n: int = 15,
-    concurrency_pages: int = 2,
-):
-    roles = roles or ["top", "jungle", "middle", "bottom", "support"]
-
+async def main():
     async with aiohttp.ClientSession() as session:
-        champs = await fetch_all_champions(session)
+        http = RiotHTTP(session)
 
-    done = load_done_keys(out_index)
+        print("Loading champion mapping from Data Dragon...")
+        id_to_name, name_to_id = await fetch_ddragon_champion_map(http)
 
-    # Keep a modest pace by adding jitter between tasks per worker
-    sem = asyncio.Semaphore(concurrency_pages)
+        print("Collecting Emerald (EUW) player sample...")
+        puuids = await collect_puuids(http, target_puuids=300, max_pages_per_div=2)
+        print(f"Got {len(puuids)} puuids.")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
+        # Aggregation stores: [games, wins]
+        overall = defaultdict(lambda: [0, 0])
+        with_ally = defaultdict(lambda: defaultdict(lambda: [0, 0]))
+        vs_enemy = defaultdict(lambda: defaultdict(lambda: [0, 0]))
 
-        async def worker(champion: str, role: str):
-            key = f"{champion}|{role}|{region}|{tier}|{patch or ''}"
-            if key in done:
-                return
+        seen_matches = set()
 
-            async with sem:
-                page = await context.new_page()
+        # Keep it gentle; scale up slowly.
+        matches_per_puuid = 20
+
+        print("Fetching match IDs and match details...")
+        for i, puuid in enumerate(puuids, 1):
+            try:
+                ids = await fetch_match_ids_for_puuid(http, puuid, count=matches_per_puuid)
+            except Exception as e:
+                continue
+
+            for mid in ids:
+                if mid in seen_matches:
+                    continue
+                seen_matches.add(mid)
                 try:
-                    data = await scrape_one(page, champion, role, region, tier, patch, top_n)
-                    append_jsonl(out_jsonl, data)
-                    done.add(key)
-                    save_done_keys(out_index, done)
-                except Exception as e:
-                    # record an error row so you can see what failed
-                    append_jsonl(out_jsonl, {
-                        "champion": champion,
-                        "role": role,
-                        "region": region,
-                        "tier": tier,
-                        "patch": patch,
-                        "error": repr(e),
-                    })
-                finally:
-                    await page.close()
+                    m = await fetch_match(http, mid)
+                    update_stats_from_match(m, overall, with_ally, vs_enemy)
+                except Exception:
+                    continue
 
-            # jitter to reduce block risk
-            await asyncio.sleep(0.5 + random.random() * 0.8)
+            if i % 25 == 0:
+                print(f"  processed {i}/{len(puuids)} puuids, matches={len(seen_matches)}")
 
-        tasks = []
-        for c in champs:
-            for r in roles:
-                tasks.append(asyncio.create_task(worker(c, r)))
+            await asyncio.sleep(0.2)  # extra politeness
 
-        await asyncio.gather(*tasks)
+        print("Computing per-champion top synergies + weak-against...")
+        out: Dict[str, Any] = {
+            "meta": {
+                "region": "EUW",
+                "queue": "RANKED_SOLO_5x5",
+                "tier": "EMERALD",
+                "sample_puuids": len(puuids),
+                "unique_matches": len(seen_matches),
+                "built_at_unix": int(time.time()),
+                "min_games_pair": 30,
+            },
+            "champions": {}
+        }
 
-        await context.close()
-        await browser.close()
+        for champ_id, (g, w) in overall.items():
+            name = id_to_name.get(champ_id)
+            if not name or g < 50:
+                continue
+            out["champions"][name.lower()] = top_synergies_and_weak_against(
+                champ_id, overall, with_ally, vs_enemy, id_to_name, top_n=10, min_games_pair=30
+            )
 
+        with open(OUT_CACHE, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False)
+
+        print(f"Saved: {OUT_CACHE}")
+        print("Done.")
 
 if __name__ == "__main__":
-    asyncio.run(build_cache())
-
+    asyncio.run(main())
